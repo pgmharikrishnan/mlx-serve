@@ -3,6 +3,7 @@ const crt = @import("crt.zig");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
+const inkling2_mod = @import("inkling2_loop.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const distributed_mod = @import("distributed.zig");
@@ -11785,6 +11786,7 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
 fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Transformer {
     var xfm: Transformer = undefined;
     xfm.rht = null;
+    xfm.inkling2 = null;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.persistent_group_state_override = persist;
@@ -17518,6 +17520,7 @@ pub const Transformer = struct {
     /// DeepSeek-V4.1 (deepseek_v41): its own module (src/deepseek_v41.zig)
     /// in the same shell, request state on the module.
     dsv41: ?*dsv41_mod.Dsv41Model = null,
+    inkling2: ?*inkling2_mod.Model = null,
     /// An mlx-stream pack (`arch/mlx_stream.zig`: DeepSeek-V4.1's EXL3 repack or MiMo-V2.6-Flash): the plugin's module.
     mlx_stream_ext: ?*mlx_stream_mod.Model = null,
 
@@ -17679,6 +17682,7 @@ pub const Transformer = struct {
         if (config.glm_stream) return initMlxStream(io, allocator, config, s);
         if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
         if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
+        if (std.mem.eql(u8, config.model_type, "inkling2_loop")) return initInkling2(allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
         // trait — one lookup table, three call sites (weight/scales/biases)
@@ -19170,6 +19174,11 @@ pub const Transformer = struct {
         if (self.dsv41) |mdl| {
             mdl.deinit();
             self.dsv41 = null;
+        }
+        if (self.inkling2) |mdl| {
+            mdl.deinit();
+            self.allocator.destroy(mdl);
+            self.inkling2 = null;
         }
         if (self.mlx_stream_ext) |m| {
             mlx_stream_mod.close(m);
@@ -20833,7 +20842,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext", "dist_peer" };
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext", "dist_peer", "inkling2" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20885,6 +20894,7 @@ pub const Transformer = struct {
         if (self.dsv4) |m| return m.n_mtp;
         if (self.dsv41) |m| return m.n_mtp;
         if (self.mlx_stream_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
+        if (self.inkling2) |m| return m.dsparkDrafts();
         return 0;
     }
 
@@ -20892,7 +20902,7 @@ pub const Transformer = struct {
         // qwen4_exp: GDN per-position capture + PLE window/token capture +
         // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
         // head's verify can rewind. dsv4 cannot.
-        return self.qwen4_mtp != null;
+        return self.qwen4_mtp != null or self.inkling2 != null;
     }
 
     /// Is this arch's MTP head the checkpoint's OWN trained layer AND measured
@@ -20915,6 +20925,7 @@ pub const Transformer = struct {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
         if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
+        if (self.inkling2) |mdl| return forwardInkling2WithImpl(self, ctx, token_ids, mdl);
         if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma 1 on gemma3 weights, 2 on Gemma 4's) never run causal decode.
@@ -46205,6 +46216,30 @@ fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weig
     errdefer mdl.deinit();
     var t = try moduleShell(allocator, config, s);
     t.dsv41 = mdl;
+    return t;
+}
+
+fn forwardInkling2WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, mdl: *inkling2_mod.Model) !mlx.mlx_array {
+    const ids = try hostIds(self, token_ids);
+    defer self.allocator.free(ids);
+    const n = ids.len;
+    if (ctx.cache.step == 0) mdl.resetState();
+    const logits = try mdl.forward(ids);
+    defer _ = mlx.mlx_array_free(logits);
+    ctx.cache.step += n;
+    const vocab_dim: c_int = @intCast(if (mdl.cfg.unpadded_vocab_size > 0) mdl.cfg.unpadded_vocab_size else mdl.cfg.vocab_size);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, logits, &[_]c_int{ 1, 1, vocab_dim }, 3, self.s));
+    return out;
+}
+
+fn initInkling2(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
+    var t = try moduleShell(allocator, config, s);
+    const m = try allocator.create(inkling2_mod.Model);
+    errdefer allocator.destroy(m);
+    m.* = try inkling2_mod.Model.init(allocator, config, weights, s);
+    t.inkling2 = m;
     return t;
 }
 

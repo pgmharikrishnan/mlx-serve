@@ -8374,7 +8374,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.mlx_stream_ext != null);
+        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or
+            slot.model.transformer.?.mlx_stream_ext != null or slot.model.transformer.?.inkling2 != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(

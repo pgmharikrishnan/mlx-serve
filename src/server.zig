@@ -7282,7 +7282,9 @@ fn renderModelEntry(
         const model_id_json = try jsonEscape(allocator, if (entry.id.len > 0) entry.id else config.model_type);
         defer allocator.free(model_id_json);
         const drafter_loaded = entry.hasDrafter();
-        const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
+        const mtp_loaded = entry.mtp != null or
+            (if (entry.transformer) |x| x.dsparkStages() > 0 else false) or
+            (if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false);
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else

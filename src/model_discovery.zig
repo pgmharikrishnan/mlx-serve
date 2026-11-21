@@ -55,6 +55,7 @@ const supported_model_types = [_][]const u8{
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
     "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
+    "inkling2_loop", // Thinking Machines Inkling 2 Mini (26.4B looped MoE)
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)

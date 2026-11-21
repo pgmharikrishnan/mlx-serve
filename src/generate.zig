@@ -5,6 +5,7 @@ const keyed_sample = @import("keyed_sample.zig");
 const transformer_mod = @import("transformer.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
+const inkling2_mod = @import("inkling2_loop.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
@@ -2770,7 +2771,7 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.mlx_stream_ext != null or xfm.inkling2 != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -2783,10 +2784,14 @@ pub const Generator = struct {
             // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
-            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else if (xfm.inkling2) |m| @as(u32, @intCast(m.dsparkDrafts() + 1)) else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
             const dspark_env_off = !dsparkEnabled();
             const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
                 DsparkArm.off
+            else if (xfm.inkling2 != null)
+                // Inkling 2's draft verifies by argmax equality only; a sampled
+                // request stays on the serial path.
+                (if (dsparkArmFor(sampling, options.logprobs_n, false) == .greedy) DsparkArm.greedy else DsparkArm.off)
             else
                 dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
             // mlx-stream's lane samples a sampled request itself, from the request's own settings.
@@ -4356,6 +4361,7 @@ pub const Generator = struct {
             const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
             return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
         }
+        if (self.xfm.inkling2) |mdl| return self.inklingDsparkStep(allocator, mdl);
         if (self.xfm.dsv41) |mdl| {
             if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
             if (self.dspark_pol != null) return self.dsparkPolicyStep(allocator, mdl);
@@ -4415,6 +4421,26 @@ pub const Generator = struct {
         else
             try mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
         return self.commitDsparkRound(allocator, round, mdl.dec_state.?.n);
+    }
+
+    /// One Inkling 2 DSpark round: the checkpoint's `mtp.safetensors` block
+    /// drafts, the trunk verifies all rows, and the module rolls its own state
+    /// back to the accepted prefix.
+    fn inklingDsparkStep(self: *Generator, allocator: std.mem.Allocator, mdl: *inkling2_mod.Model) !?DrafterStepResult {
+        const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+        const r = inkling2_mod.Model.dsparkRound(mdl, allocator, self.next_token_id, cap) catch |e| switch (e) {
+            error.NoDspark => {
+                const tok = (try self.next(allocator)) orelse return null;
+                const tokens = try allocator.alloc(u32, 1);
+                tokens[0] = tok;
+                return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+            },
+            else => return e,
+        };
+        var round = dsv4_mod.DsparkRound{ .tokens = r.tokens, .next_token = r.next_token, .accepted = r.accepted };
+        _ = &round;
+        self.dspark_stats.record(@intCast(r.tokens.len -| 1), r.accepted);
+        return self.commitDsparkRound(allocator, round, r.position);
     }
 
     /// A round the drafting backoff skipped: one tick of the serial pipeline. Consecutive ticks time the plain step.

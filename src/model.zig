@@ -448,6 +448,31 @@ pub const ModelConfig = struct {
     logits_mup_width_multiplier: f32 = 1.0,
     // Slice logits to the first N rows (vocab padding; 0 = full vocab).
     unpadded_vocab_size: u32 = 0,
+    // Inkling 2 Loop (inkling2_loop): looped middle layers, attn_res, softcapped SwiGLU, L2 clip.
+    is_inkling2_loop: bool = false,
+    physical_num_layers: u32 = 0,
+    loop_core_start: u32 = 0,
+    loop_core_end: u32 = 0,
+    loop_num_passes: u32 = 1,
+    loop_gate_rank: u32 = 0,
+    n_layers_per_attn_res_block: u32 = 6,
+    mlp_gate_softcap: f32 = 0.0,
+    mlp_up_softcap: f32 = 0.0,
+    qk_l2_clip_threshold: f32 = 0.0,
+    rel_l2_clip_threshold: f32 = 0.0,
+
+    // Inkling 2's DSpark draft (`mtp.safetensors`, the checkpoint's `mtp_config`).
+    dspark_block: u32 = 0,
+    dspark_num_layers: u32 = 0,
+    dspark_intermediate_size: u32 = 0,
+    dspark_markov_rank: u32 = 0,
+    dspark_rope_theta: f32 = 1000000.0,
+    /// Bit i: draft layer i is a sliding-window layer (`local_layer_ids`).
+    dspark_local_mask: u32 = 0,
+    /// Target layer VISITS whose hidden the draft reads; the last entry is the
+    /// final-norm output (== the target's total visits).
+    dspark_taps: [8]u32 = @splat(0),
+    dspark_ntaps: u32 = 0,
 
     // DeepSeek V4 Flash (deepseek_v4). MQA over ONE head_dim-wide latent
     // (num_key_value_heads == 1): low-rank Q (wq_a → q_norm → wq_b, then an
@@ -1332,7 +1357,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn isInkling(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "inkling_mm_model");
+        return std.mem.eql(u8, self.model_type, "inkling_mm_model") or self.is_inkling2_loop;
     }
 
     /// Google EmbeddingGemma 2 (`embedding_gemma2`): a bidirectional Gemma 4 text trunk with
@@ -1593,6 +1618,11 @@ pub const ModelConfig = struct {
         if (self.isGlm5()) return true;
         // deepseek_v41: DeepSeek's template defaults `thinking_mode` to thinking.
         if (self.isDsv41()) return true;
+        // inkling2_loop: the template's own default is `reasoning_effort` 0.9,
+        // and the effort-0 ("none") prompt is out of distribution — the model
+        // answers with an EMPTY message (two tokens, `<|message_model|>` then
+        // EOS), so a tool-less request must think by default.
+        if (self.is_inkling2_loop) return true;
         // glm_moe_dsa: the template opens `<think>` on every assistant turn, as glm5_next.
         if (self.isGlmMoeDsa()) return true;
 
@@ -1630,7 +1660,7 @@ pub const ModelConfig = struct {
         } else if (is_gemma) {
             if (self.gen_top_k == null) self.gen_top_k = 64;
             if (self.gen_top_p == null) self.gen_top_p = 0.95;
-        } else if (std.mem.eql(u8, t, "inkling_mm_model")) {
+        } else if (std.mem.eql(u8, t, "inkling_mm_model") or std.mem.eql(u8, t, "inkling2_loop")) {
             // Thinking Machines publishes NO recommendation (no
             // generation_config.json in any Inkling repo; their bundled
             // tooling samples greedily), so top_p 0.95 is OUR choice to cut
@@ -4132,6 +4162,150 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 return error.UnsupportedInklingConfig;
             }
         }
+    } else if (std.mem.eql(u8, model_type, "inkling2_loop")) {
+        // Thinking Machines Inkling 2 Mini (26.4B looped MoE, text path).
+        config.model_type = "inkling2_loop";
+        config.is_inkling2_loop = true;
+        config.weight_prefix = "model.llm";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.rope_scaling_factor = 1.0;
+        config.query_pre_attn_scalar = config.head_dim;
+        config.moe_intermediate_size = config.intermediate_size;
+        config.first_k_dense_replace = 0;
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "route_scale")) |v| config.router_scaling_factor = try jsonFloat(v);
+        if (jsonField(cfg_obj, "d_rel")) |v| {
+            if (v == .integer) config.inkling_d_rel = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "rel_extent")) |v| {
+            if (v == .integer) config.inkling_rel_extent = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "log_scaling_n_floor")) |v| {
+            if (v == .integer) config.inkling_log_n_floor = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "log_scaling_alpha")) |v| config.inkling_log_alpha = try jsonFloat(v);
+        if (jsonField(cfg_obj, "sconv_kernel_size")) |v| {
+            if (v == .integer) config.inkling_sconv_kernel = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "n_layers_per_attn_res_block")) |v| {
+            if (v == .integer) config.n_layers_per_attn_res_block = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "mlp_gate_softcap")) |v| config.mlp_gate_softcap = try jsonFloat(v);
+        if (jsonField(cfg_obj, "mlp_up_softcap")) |v| config.mlp_up_softcap = try jsonFloat(v);
+        if (jsonField(cfg_obj, "qk_l2_clip_threshold")) |v| config.qk_l2_clip_threshold = try jsonFloat(v);
+        if (jsonField(cfg_obj, "rel_l2_clip_threshold")) |v| config.rel_l2_clip_threshold = try jsonFloat(v);
+        config.has_embedding_norm = true;
+        if (jsonField(cfg_obj, "sliding_window_size")) |v| {
+            if (v == .integer) {
+                config.sliding_window = try jsonU32(v);
+                config.has_sliding_window = true;
+            }
+        }
+        if (jsonField(cfg_obj, "unpadded_vocab_size")) |v| {
+            if (v == .integer) config.unpadded_vocab_size = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "model_max_length")) |v| {
+            if (v == .integer) config.max_position_embeddings = try jsonU32(v);
+        }
+        config.has_vision = false;
+
+        // Parse loop_config and expand logical layer visits for KV/SSM caches.
+        const phys_layers = config.num_hidden_layers;
+        config.physical_num_layers = phys_layers;
+        var core_start: u32 = 0;
+        var core_end: u32 = 0;
+        var num_passes: u32 = 1;
+        if (jsonField(cfg_obj, "loop_config")) |lc| {
+            if (lc == .object) {
+                if (jsonField(lc.object, "core_start")) |v| if (v == .integer) { core_start = try jsonU32(v); };
+                if (jsonField(lc.object, "core_end")) |v| if (v == .integer) { core_end = try jsonU32(v); };
+                if (jsonField(lc.object, "num_passes")) |v| if (v == .integer) { num_passes = try jsonU32(v); };
+                if (jsonField(lc.object, "gate_rank")) |v| if (v == .integer) { config.loop_gate_rank = try jsonU32(v); };
+            }
+        }
+        config.loop_core_start = core_start;
+        config.loop_core_end = core_end;
+        config.loop_num_passes = num_passes;
+        const core_len = if (core_end > core_start) core_end - core_start else 0;
+        const total_visits: u32 = if (core_len > 0)
+            core_start + core_len * num_passes + (phys_layers - core_end)
+        else
+            phys_layers;
+        config.num_hidden_layers = total_visits;
+
+        var phys_global: [128]bool = @splat(true);
+        if (jsonField(cfg_obj, "local_layer_ids")) |v| {
+            if (v == .array) {
+                config.has_explicit_layer_types = true;
+                for (v.array.items) |item| {
+                    if (item == .integer and item.integer >= 0 and item.integer < 128) {
+                        phys_global[@intCast(item.integer)] = false;
+                    }
+                }
+            }
+        }
+        if (core_len > 0) {
+            var vi: u32 = 0;
+            for (0..core_start) |pi| {
+                if (vi < 128) config.layer_is_global[vi] = phys_global[pi];
+                vi += 1;
+            }
+            for (0..num_passes) |_| {
+                for (core_start..core_end) |pi| {
+                    if (vi < 128) config.layer_is_global[vi] = phys_global[pi];
+                    vi += 1;
+                }
+            }
+            for (core_end..phys_layers) |pi| {
+                if (vi < 128) config.layer_is_global[vi] = phys_global[pi];
+                vi += 1;
+            }
+        } else {
+            for (0..@min(phys_layers, 128)) |pi| {
+                config.layer_is_global[pi] = phys_global[pi];
+            }
+        }
+
+        // The bundled DSpark draft (`mtp.safetensors`): dims and the four
+        // target-layer visits it reads. `mtp_config` sits at the ROOT, beside
+        // `text_config`, and is absent on packs converted without the draft.
+        if (jsonField(root, "mtp_config")) |mc| if (mc == .object) {
+            if (jsonField(mc.object, "block_size")) |v| if (v == .integer) {
+                config.dspark_block = try jsonU32(v);
+            };
+            if (jsonField(mc.object, "num_hidden_layers")) |v| if (v == .integer) {
+                config.dspark_num_layers = try jsonU32(v);
+            };
+            if (jsonField(mc.object, "intermediate_size")) |v| if (v == .integer) {
+                config.dspark_intermediate_size = try jsonU32(v);
+            };
+            if (jsonField(mc.object, "markov_rank")) |v| if (v == .integer) {
+                config.dspark_markov_rank = try jsonU32(v);
+            };
+            if (jsonField(mc.object, "rope_theta")) |v| config.dspark_rope_theta = try jsonFloat(v);
+            if (jsonField(mc.object, "local_layer_ids")) |v| if (v == .array) {
+                for (v.array.items) |item| {
+                    if (item == .integer and item.integer >= 0 and item.integer < 32) {
+                        config.dspark_local_mask |= @as(u32, 1) << @intCast(item.integer);
+                    }
+                }
+            };
+            if (jsonField(mc.object, "target_layer_ids")) |v| if (v == .array) {
+                var n: u32 = 0;
+                for (v.array.items) |item| {
+                    if (n >= config.dspark_taps.len) break;
+                    config.dspark_taps[n] = try jsonU32(item);
+                    n += 1;
+                }
+                config.dspark_ntaps = n;
+            };
+        };
     } else if (std.mem.eql(u8, model_type, "deepseek_v4") or std.mem.eql(u8, model_type, "deepseek_v41")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -5235,6 +5409,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     if (config.modelopt) try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
     if (config.dist_shard) |sh| try shardExperts(&weights, sh, config.modelopt);
     if (config.isDsv41() and !(if (config.dist_dsv41) |p| p.worker else false)) try loadDsv41Residents(io, allocator, &weights, model_dir);
+    if (config.is_inkling2_loop) try loadInkling2Draft(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
         defer reportF16Narrowing();
         resolveWeightPrefix(config, &weights);
@@ -5267,6 +5442,18 @@ fn loadDsv41Residents(io: std.Io, allocator: std.mem.Allocator, weights: *Weight
     std.Io.Dir.accessAbsolute(io, path, .{}) catch return;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
+    try loadSafetensorsFile(allocator, weights, path, s, .{});
+}
+
+/// Inkling 2 ships its DSpark draft as `mtp.safetensors` beside the trunk
+/// shards; the index does not name it, so the directory scan skips it.
+fn loadInkling2Draft(io: std.Io, allocator: std.mem.Allocator, weights: *Weights, model_dir: []const u8) !void {
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.safetensors", .{model_dir}, 0);
+    defer allocator.free(path);
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    log.info("Loading mtp.safetensors (DSpark draft)...\n", .{});
     try loadSafetensorsFile(allocator, weights, path, s, .{});
 }
 
